@@ -1,0 +1,29 @@
+{
+    "folders": [
+        {
+            "path": "."
+        }
+    ],
+    "settings": {
+        // Python interpreter path for this workspace
+        "python.defaultInterpreterPath": "${workspaceFolder}/.venv/bin/python",
+
+        // Ensure linting and formatting work correctly
+        "python.linting.enabled": true,
+        "python.formatting.provider": "autopep8",
+
+        // Make Jupyter notebooks run inside the venv
+        "jupyter.jupyterServerType": "local",
+        "jupyter.notebookFileRoot": "${workspaceFolder}",
+
+        // Ensure terminal uses bash inside WSL
+        "terminal.integrated.defaultProfile.linux": "bash",
+
+        // Recommended folder exclusions
+        "files.exclude": {
+            "**/__pycache__": true,
+            "**/*.pyc": true,
+            "**/.pytest_cache": true
+        }
+    }
+}
