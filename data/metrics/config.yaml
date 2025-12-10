@@ -1,0 +1,13 @@
+# Training configuration for MNIST project
+
+run_name: "run2"       # <-- Important! Enables multiple experiment runs
+
+train:
+  epochs: 8
+  batch_size: 32
+
+paths:
+  model_dir: "models"
+  metrics_dir: "data/metrics"
+  raw_dir: "data/raw"
+  processed_dir: "data/processed"

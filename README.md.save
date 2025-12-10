@@ -1,19 +1,54 @@
 # MNIST Classification (WSL + GPU + TensorFlow)
 
-This repository contains an end-to-end MNIST handwritten-digit classifier, set up for:
+# MNIST Classification (TensorFlow + FastAPI)
 
-- **WSL2 / Ubuntu 22.04**
-- **NVIDIA RTX 3090** with CUDA-enabled TensorFlow
-- **VS Code** + Git + SSH
-- Optional **FastAPI** + **Docker** for serving
+<p align="center">
+  <img src="docs/img/mnist_banner.png" width="600" alt="MNIST classification banner">
+</p>
+
+<p align="center">
+  <a href="https://www.python.org/">
+    <img src="https://img.shields.io/badge/python-3.10%2B-blue.svg" alt="Python 3.10+">
+  </a>
+  <a href="https://www.tensorflow.org/">
+    <img src="https://img.shields.io/badge/TensorFlow-2.x-ff6f00.svg" alt="TensorFlow">
+  </a>
+  <a href="https://fastapi.tiangolo.com/">
+    <img src="https://img.shields.io/badge/FastAPI-ready-009688.svg" alt="FastAPI">
+  </a>
+  <a href="https://hub.docker.com/">
+    <img src="https://img.shields.io/badge/docker-containerized-2496ED.svg" alt="Docker">
+  </a>
+  <a href="https://github.com/karimladha1/mnist_classification/actions">
+    <img src="https://img.shields.io/badge/tests-pytest-green.svg" alt="Tests: pytest">
+  </a>
+  <a href="LICENSE">
+    <img src="https://img.shields.io/badge/license-MIT-green.svg" alt="License: MIT">
+  </a>
+</p>
+
+---
+
+## Overview
+
+This project implements a **handwritten digit classifier** on the **MNIST dataset** using
+TensorFlow/Keras. It includes:
+
+- A clean, reusable ML project structure
+- Training, evaluation, and prediction scripts
+- JSON logging of metrics per run (`data/metrics/`)
+- Optional **FastAPI** service for online inference
+- A **Dockerfile** to containerize the API
+- Tests and hooks to support a professional development workflow
+
+The goal is to serve as a **template for future ML projects** as well as a
+concrete, working MNIST example.
 
 ---
 
 ## Project Structure
 
-
 ```text
-
 mnist_classification/
 │
 ├── src/                              # Core source code
@@ -34,7 +69,10 @@ mnist_classification/
 │
 ├── tests/                            # Pytest unit tests
 │
-├── docs/                             # Documentation assets
+├── docs/                             # Documentation site + assets
+│   ├── index.md                      # MkDocs home page
+│   ├── getting-started.md            # Installation / usage
+│   ├── api.md                        # API & CLI docs
 │   └── img/
 │       └── mnist_banner.png          # README banner image
 │
@@ -48,7 +86,8 @@ mnist_classification/
 
 
 
-#Environment Setup
+# Getting Started Environment Setup
+
 Prerequisites
 WSL2 with Ubuntu 22.04
 Python 3.10+
@@ -56,16 +95,42 @@ NVIDIA driver + CUDA toolkit (host)
 VS Code with Remote WSL + Python extensions
 Git with SSH keys configured
 
-# Clone
+# 1 Clone the repository
 git clone git@github.com:karimladha1/mnist_classification.git
 cd mnist_classification
-# 1 Create and activate venv (inside WSL)
-python3 -m venv .venv
-source .venv/bin/activate
-# 2 Install dependencies
+
+# 2 Create and activate venv (inside WSL)
+python3.10 -m venv .venv
+source .venv/bin/activate         # Linux/WSL/macOS
+# .venv\Scripts\activate          # Windows PowerShell
+
+
+# 3 Install dependencies
 pip install -r requirements.txt
 
-#3 GPU Support
+# 4 GPU Support
+
+# Configuration: Training and paths are controlled by config.yaml. Example fields:
+# Change these values to run different experiments (epochs, batch size, etc.).
+seed: 42
+data:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  metrics_dir: data/metrics
+training:
+  batch_size: 128
+  epochs: 10
+  learning_rate: 0.001
+  validation_split: 0.1
+model:
+  type: simple_cnn
+  save_dir: models
+logging:
+  metrics_to_console: true
+
+
+
+
 
 # Setup
 # Clone
