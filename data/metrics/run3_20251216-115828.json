@@ -1,0 +1,44 @@
+{
+  "amp_enabled": true,
+  "augmentation": true,
+  "batch_size": 64,
+  "best_model": "models/run3_20251216-115828_best.keras",
+  "config_used": {
+    "amp": true,
+    "batch_size": 64,
+    "cosine_min_factor": 0.05,
+    "early_stop_monitor": "val_accuracy",
+    "early_stop_patience": 3,
+    "epochs": 15,
+    "gpu_memory_growth": true,
+    "learning_rate": 0.001,
+    "run_name": "run3",
+    "schedule": "warmup_cosine",
+    "seed": 42,
+    "warmup_epochs": 3,
+    "warmup_initial_factor": 0.1
+  },
+  "epochs": 15,
+  "final_model": "models/run3_20251216-115828.keras",
+  "gpu_memory_growth": true,
+  "gpus": [
+    "PhysicalDevice(name='/physical_device:GPU:0', device_type='GPU')"
+  ],
+  "learning_rate": 0.001,
+  "monitors": {
+    "checkpoint_monitor": "val_accuracy",
+    "early_stop_monitor": "val_accuracy",
+    "early_stop_patience": 3
+  },
+  "policy": "<DTypePolicy \"mixed_float16\">",
+  "run_name": "run3_20251216-115828",
+  "schedule": "warmup_cosine",
+  "temperature": 1.1579667329788208,
+  "temperature_sidecar": "models/run3_20251216-115828_best.keras.temperature.json",
+  "tensorflow_version": "2.20.0",
+  "test_accuracy": 0.9897000193595886,
+  "test_loss": 0.033040471374988556,
+  "timestamp": "2025-12-16T12:06:26.428818",
+  "validation_split": 0.1,
+  "xla": false
+}
