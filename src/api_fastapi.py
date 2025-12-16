@@ -1,283 +1,552 @@
-from fastapi import FastAPI
-from fastapi.responses import JSONResponse, HTMLResponse
-from pydantic import BaseModel
+"""
+FastAPI inference API for the MNIST classifier (logits-based + temperature scaling).
 
-import tensorflow as tf
-import numpy as np
-from PIL import Image
-import io
+Run (from repo root):
+    uvicorn src.api_fastapi:app --reload --host 127.0.0.1 --port 8000
+"""
+
+from __future__ import annotations
+
 import base64
+import json
 import os
+from pathlib import Path
+from threading import Lock
+from typing import Any, Literal
 
-# ----------------------------------------------------
-# Load model once at startup
-# ----------------------------------------------------
-MODEL_PATH = os.path.join("models", "mnist_model.h5")
+import numpy as np
+import tensorflow as tf
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel, Field, model_validator
 
-print(f"[api] Loading model from: {MODEL_PATH}")
-model = tf.keras.models.load_model(MODEL_PATH)
-print("[api] Model loaded.")
+from utils import PROJECT_ROOT, resolve_under_root
 
+# -------------------------------------------------------------------
+# Config
+# -------------------------------------------------------------------
 
-# ----------------------------------------------------
-# Pydantic models
-# ----------------------------------------------------
-class PixelsPayload(BaseModel):
-    pixels: list[float]  # 784 values
+NUM_CLASSES = 10
+MODELS_DIR = PROJECT_ROOT / "models"
 
+DEFAULT_CONF_THRESHOLD = float(os.getenv("CONF_THRESHOLD", "0.60"))
 
-class CanvasPayload(BaseModel):
-    image_base64: str  # "data:image/png;base64,...."
+# Blank heuristics (tune as needed for your drawing input)
+DEFAULT_BLANK_MAX_THRESHOLD = float(os.getenv("BLANK_MAX_THRESHOLD", "0.05"))
+DEFAULT_BLANK_MEAN_THRESHOLD = float(os.getenv("BLANK_MEAN_THRESHOLD", "0.002"))
+DEFAULT_MIN_INK_PIXELS = int(os.getenv("MIN_INK_PIXELS", "12"))
+DEFAULT_INK_THRESHOLD = float(os.getenv("INK_THRESHOLD", "0.08"))
 
+# Used only if:
+# - request doesn't pass temperature, AND
+# - no per-model temperature file exists.
+DEFAULT_TEMPERATURE = float(os.getenv("TEMPERATURE", "1.0"))
 
-# ----------------------------------------------------
-# Helper functions
-# ----------------------------------------------------
-def preprocess_pixels(pixels: list[float]) -> np.ndarray:
-    """Convert a flat 784-element list into a (1, 28, 28, 1) tensor."""
-    arr = np.array(pixels, dtype="float32")
-    arr = arr.reshape(28, 28)
-    arr = arr / 255.0
-    arr = arr[np.newaxis, ..., np.newaxis]  # (1, 28, 28, 1)
-    return arr
+# Sidecar file naming produced by training:
+#   models/<run>_best.keras -> models/<run>_best.keras.temperature.json
+TEMP_SUFFIX = ".temperature.json"
 
+# Optional: include extra metadata in predict response (debugging)
+DEFAULT_RETURN_DEBUG = os.getenv("RETURN_DEBUG", "0").strip().lower() in {"1", "true", "yes"}
 
-def preprocess_canvas(base64_str: str) -> np.ndarray:
-    """
-    Convert base64 PNG from <canvas> to (1, 28, 28, 1) tensor.
-    We convert to grayscale, resize to 28x28, invert colors
-    (black background, white digit), then normalize.
-    """
-    # Strip header: "data:image/png;base64,...."
-    if "," in base64_str:
-        base64_str = base64_str.split(",", 1)[1]
+# Warm-load default model at startup (recommended)
+DEFAULT_WARM_START = os.getenv("WARM_START", "1").strip().lower() in {"1", "true", "yes"}
 
-    image_bytes = base64.b64decode(base64_str)
-    img = Image.open(io.BytesIO(image_bytes)).convert("L")  # grayscale
-    img = img.resize((28, 28), Image.LANCZOS)
-
-    arr = np.array(img).astype("float32")
-
-    # Invert colors: canvas is usually black bg, white drawing
-    # If your drawing looks inverted, comment this line out.
-    arr = 255.0 - arr
-
-    arr = arr / 255.0
-    arr = arr[np.newaxis, ..., np.newaxis]  # (1, 28, 28, 1)
-    return arr
-
-
-def predict_from_tensor(tensor: np.ndarray) -> dict:
-    """Run model prediction and return digit + confidence."""
-    probs = model.predict(tensor, verbose=0)[0]
-    digit = int(np.argmax(probs))
-    confidence = float(np.max(probs))
-    return {"prediction": digit, "confidence": confidence}
-
-
-# ----------------------------------------------------
+# -------------------------------------------------------------------
 # FastAPI app
-# ----------------------------------------------------
-app = FastAPI(title="MNIST Classification API")
+# -------------------------------------------------------------------
+
+app = FastAPI(title="MNIST Inference API (logits + temperature scaling)")
+
+# -------------------------------------------------------------------
+# Thread-safe caches
+# -------------------------------------------------------------------
+
+_lock = Lock()
+_model_cache: dict[str, tf.keras.Model] = {}  # key = abs model path
+_model_mtime_cache: dict[str, float] = {}  # key = abs model path -> mtime
+_temp_cache: dict[str, float] = {}  # key = abs model path -> temperature
+
+# -------------------------------------------------------------------
+# Utilities: model resolution + caching
+# -------------------------------------------------------------------
 
 
-@app.get("/", response_class=JSONResponse)
-def root():
+def _find_latest_model() -> Path:
+    """Prefer *_best.keras, otherwise newest *.keras."""
+    if not MODELS_DIR.exists():
+        raise FileNotFoundError(f"Models directory not found: {MODELS_DIR}")
+
+    best = sorted(MODELS_DIR.glob("*_best.keras"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if best:
+        return best[0]
+
+    all_models = sorted(MODELS_DIR.glob("*.keras"), key=lambda p: p.stat().st_mtime, reverse=True)
+    if not all_models:
+        raise FileNotFoundError(f"No .keras models found in {MODELS_DIR}")
+
+    return all_models[0]
+
+
+def _resolve_model_path(model_file: str | None) -> Path:
+    """
+    Resolve model from:
+      1) explicit request model_file (filename in models/ or absolute)
+      2) MODEL_PATH env var
+      3) latest model in models/ (prefers *_best.keras)
+    """
+    if model_file:
+        p = Path(model_file).expanduser()
+        if not p.is_absolute():
+            p = MODELS_DIR / p
+        p = p.resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"Requested model not found: {p}")
+        return p
+
+    env_path = os.getenv("MODEL_PATH")
+    if env_path:
+        p = resolve_under_root(env_path).expanduser().resolve()
+        if not p.exists():
+            raise FileNotFoundError(f"MODEL_PATH invalid: {p}")
+        return p
+
+    return _find_latest_model()
+
+
+def _load_model_cached(path: Path) -> tf.keras.Model:
+    """Loads model with cache. Reloads automatically if file mtime changes."""
+    abs_path = str(path.resolve())
+    mtime = path.stat().st_mtime
+
+    with _lock:
+        if abs_path in _model_cache:
+            cached_mtime = _model_mtime_cache.get(abs_path, -1.0)
+            if abs(mtime - cached_mtime) < 1e-6:
+                return _model_cache[abs_path]
+            # model file changed -> reload
+            _model_cache.pop(abs_path, None)
+            _model_mtime_cache.pop(abs_path, None)
+
+        # compile=False is best for inference (avoids optimizer warnings/state)
+        model = tf.keras.models.load_model(path, compile=False)
+        _model_cache[abs_path] = model
+        _model_mtime_cache[abs_path] = mtime
+        return model
+
+
+# -------------------------------------------------------------------
+# Temperature: sidecar + cache
+# -------------------------------------------------------------------
+
+
+def _temperature_sidecar_path(model_path: Path) -> Path:
+    return model_path.with_suffix(model_path.suffix + TEMP_SUFFIX)
+
+
+def _load_temperature_for_model(model_path: Path) -> float:
+    """
+    Load per-model temperature from sidecar JSON if present.
+    Falls back to DEFAULT_TEMPERATURE.
+    """
+    key = str(model_path.resolve())
+
+    with _lock:
+        if key in _temp_cache:
+            return _temp_cache[key]
+
+    sidecar = _temperature_sidecar_path(model_path)
+    t = DEFAULT_TEMPERATURE
+
+    if sidecar.exists():
+        try:
+            data = json.loads(sidecar.read_text(encoding="utf-8"))
+            t_val = data.get("temperature", data.get("T", None))
+            if t_val is not None:
+                t = float(t_val)
+        except Exception:
+            t = DEFAULT_TEMPERATURE
+
+    # Guardrails
+    t = float(np.clip(t, 0.05, 10.0))
+
+    with _lock:
+        _temp_cache[key] = t
+
+    return t
+
+
+# -------------------------------------------------------------------
+# Logits -> probabilities + metrics
+# -------------------------------------------------------------------
+
+
+def _softmax_2d(x: np.ndarray) -> np.ndarray:
+    """Stable softmax for (N, C) array."""
+    x = x.astype(np.float64, copy=False)
+    x = x - np.max(x, axis=1, keepdims=True)
+    ex = np.exp(x)
+    s = np.sum(ex, axis=1, keepdims=True)
+    return ex / np.where(s > 0, s, 1.0)
+
+
+def _logits_to_probs(logits: np.ndarray, temperature: float) -> np.ndarray:
+    """Temperature scaling on logits."""
+    t = float(np.clip(temperature, 0.05, 10.0))
+    return _softmax_2d(logits / t)
+
+
+def _entropy(p: np.ndarray) -> np.ndarray:
+    """Entropy for (N, C) probabilities."""
+    p = np.clip(p, 1e-12, 1.0)
+    return -np.sum(p * np.log(p), axis=1)
+
+
+def _topk(probs: np.ndarray, k: int = 3) -> list[list[dict[str, Any]]]:
+    """Top-k per row."""
+    k = int(np.clip(k, 1, probs.shape[1]))
+    idx = np.argsort(-probs, axis=1)[:, :k]
+    out: list[list[dict[str, Any]]] = []
+    for i in range(probs.shape[0]):
+        out.append([{"class": int(c), "prob": float(probs[i, c])} for c in idx[i]])
+    return out
+
+
+# -------------------------------------------------------------------
+# Input parsing / preprocessing
+# -------------------------------------------------------------------
+
+
+def _to_28x28_from_pixels(pixels: list[list[float]]) -> np.ndarray:
+    arr = np.array(pixels, dtype=np.float32)
+    if arr.shape != (28, 28):
+        raise ValueError(f"pixels must be 28x28; got {arr.shape}")
+    # If user sends 0..255, normalize
+    if arr.max() > 1.5:
+        arr = arr / 255.0
+    arr = np.clip(arr, 0.0, 1.0)
+    return arr
+
+
+def _to_28x28_from_b64(image_b64: str) -> np.ndarray:
+    try:
+        raw = base64.b64decode(image_b64, validate=True)
+    except Exception as e:
+        raise ValueError(f"image_b64 is not valid base64: {e}")
+
+    # Use TF image decode to avoid extra deps
+    img = tf.io.decode_image(raw, channels=1, expand_animations=False)  # [H,W,1], uint8
+    img = tf.image.resize(img, (28, 28), method="bilinear")
+    img = tf.cast(img, tf.float32) / 255.0
+    img = tf.squeeze(img, axis=-1)  # [28,28]
+    arr = img.numpy().astype(np.float32)
+    arr = np.clip(arr, 0.0, 1.0)
+    return arr
+
+
+def _blank_metrics(x28: np.ndarray) -> dict[str, float]:
+    mx = float(np.max(x28))
+    mean = float(np.mean(x28))
+    ink_pixels = int(np.sum(x28 > DEFAULT_INK_THRESHOLD))
+    return {"max": mx, "mean": mean, "ink_pixels": float(ink_pixels)}
+
+
+def _is_blank(
+    x28: np.ndarray,
+    blank_max_threshold: float,
+    blank_mean_threshold: float,
+    min_ink_pixels: int,
+    ink_threshold: float,
+) -> bool:
+    mx = float(np.max(x28))
+    mean = float(np.mean(x28))
+    ink_pixels = int(np.sum(x28 > float(ink_threshold)))
+
+    # Practical rule:
+    # - If there are very few ink pixels => blank
+    # - Or if BOTH max and mean are very low => blank
+    if ink_pixels < int(min_ink_pixels):
+        return True
+    if (mx < float(blank_max_threshold)) and (mean < float(blank_mean_threshold)):
+        return True
+    return False
+
+
+# -------------------------------------------------------------------
+# Pydantic models
+# -------------------------------------------------------------------
+
+
+class PredictRequest(BaseModel):
+    # Provide either pixels or image_b64
+    pixels: list[list[float]] | None = Field(
+        default=None,
+        description="28x28 grayscale pixels as nested list. Values in [0,1] or [0,255].",
+    )
+    image_b64: str | None = Field(
+        default=None,
+        description="Base64-encoded image (PNG/JPG). Will be converted to 28x28 grayscale.",
+    )
+
+    model_file: str | None = Field(
+        default=None,
+        description="Model filename inside models/ (e.g. run3_..._best.keras) or absolute path.",
+    )
+
+    temperature: float | None = Field(
+        default=None,
+        ge=0.05,
+        le=10.0,
+        description="Override temperature scaling. If omitted: uses per-model sidecar or env default.",
+    )
+
+    conf_threshold: float | None = Field(
+        default=None,
+        ge=0.0,
+        le=1.0,
+        description="Override confidence threshold. If omitted: uses env default.",
+    )
+
+    return_debug: bool | None = Field(
+        default=None, description="If true, include extra debug fields."
+    )
+
+    topk: int = Field(default=3, ge=1, le=10, description="How many top predictions to return.")
+
+    # Optional overrides for blank heuristics (leave None to use env defaults)
+    blank_max_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    blank_mean_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+    min_ink_pixels: int | None = Field(default=None, ge=0, le=784)
+    ink_threshold: float | None = Field(default=None, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def _one_input_required(self) -> PredictRequest:
+        if self.pixels is None and self.image_b64 is None:
+            raise ValueError("Provide either 'pixels' (28x28) or 'image_b64'.")
+        return self
+
+
+class PredictResponse(BaseModel):
+    status: Literal["ok"] = "ok"
+    model: str
+    temperature: float
+    conf_threshold: float
+
+    is_blank: bool
+    accepted: bool
+
+    pred_class: int | None = None
+    confidence: float | None = None
+    entropy: float | None = None
+    margin: float | None = None
+
+    topk: list[dict[str, Any]] | None = None
+
+    debug: dict[str, Any] | None = None
+
+
+# -------------------------------------------------------------------
+# Endpoints
+# -------------------------------------------------------------------
+
+
+@app.get("/health")
+def health() -> dict[str, Any]:
+    try:
+        default_model_path = _resolve_model_path(None)
+        default_temp = _load_temperature_for_model(default_model_path)
+    except Exception:
+        default_model_path = None
+        default_temp = DEFAULT_TEMPERATURE
+
+    gpus = [d.name for d in tf.config.list_physical_devices("GPU")]
     return {
-        "message": "MNIST API is up. POST to /predict with 784 pixels or use /draw to draw a digit."
+        "status": "ok",
+        "models_dir": str(MODELS_DIR),
+        "default_model": str(default_model_path.name) if default_model_path else None,
+        "default_temperature": float(default_temp),
+        "default_conf_threshold": float(DEFAULT_CONF_THRESHOLD),
+        "blank_thresholds": {
+            "blank_max_threshold": float(DEFAULT_BLANK_MAX_THRESHOLD),
+            "blank_mean_threshold": float(DEFAULT_BLANK_MEAN_THRESHOLD),
+            "min_ink_pixels": int(DEFAULT_MIN_INK_PIXELS),
+            "ink_threshold": float(DEFAULT_INK_THRESHOLD),
+        },
+        "gpus": gpus,
     }
 
 
-# --------- JSON pixels endpoint (existing style) --------------
-@app.post("/predict", response_class=JSONResponse)
-def predict(payload: PixelsPayload):
-    if len(payload.pixels) != 784:
-        return JSONResponse(
-            status_code=400,
-            content={"error": "Expected 784 pixel values (28x28)."},
+@app.get("/models")
+def list_models() -> dict[str, Any]:
+    if not MODELS_DIR.exists():
+        raise HTTPException(status_code=500, detail=f"Models directory not found: {MODELS_DIR}")
+
+    models = sorted(MODELS_DIR.glob("*.keras"), key=lambda p: p.stat().st_mtime, reverse=True)
+    out = []
+    for p in models:
+        sidecar = _temperature_sidecar_path(p)
+        out.append(
+            {
+                "file": p.name,
+                "mtime": p.stat().st_mtime,
+                "has_temperature_sidecar": sidecar.exists(),
+            }
         )
-
-    tensor = preprocess_pixels(payload.pixels)
-    result = predict_from_tensor(tensor)
-    return result
+    return {"models": out}
 
 
-# --------- Canvas image endpoint (for draw UI) ---------------
-@app.post("/predict_canvas", response_class=JSONResponse)
-def predict_canvas(payload: CanvasPayload):
+@app.post("/predict", response_model=PredictResponse)
+def predict(req: PredictRequest) -> PredictResponse:
+    # Resolve model + load
     try:
-        tensor = preprocess_canvas(payload.image_base64)
-        result = predict_from_tensor(tensor)
-        return result
+        model_path = _resolve_model_path(req.model_file)
+        model = _load_model_cached(model_path)
     except Exception as e:
-        return JSONResponse(
-            status_code=400,
-            content={"error": f"Failed to process image: {e}"},
+        raise HTTPException(status_code=400, detail=str(e))
+
+    # Temperature resolution: request -> sidecar -> default
+    if req.temperature is not None:
+        temperature = float(req.temperature)
+    else:
+        temperature = float(_load_temperature_for_model(model_path))
+
+    conf_threshold = (
+        float(req.conf_threshold)
+        if req.conf_threshold is not None
+        else float(DEFAULT_CONF_THRESHOLD)
+    )
+    return_debug = (
+        bool(req.return_debug) if req.return_debug is not None else bool(DEFAULT_RETURN_DEBUG)
+    )
+
+    # Blank override thresholds
+    blank_max_threshold = (
+        float(req.blank_max_threshold)
+        if req.blank_max_threshold is not None
+        else float(DEFAULT_BLANK_MAX_THRESHOLD)
+    )
+    blank_mean_threshold = (
+        float(req.blank_mean_threshold)
+        if req.blank_mean_threshold is not None
+        else float(DEFAULT_BLANK_MEAN_THRESHOLD)
+    )
+    min_ink_pixels = (
+        int(req.min_ink_pixels) if req.min_ink_pixels is not None else int(DEFAULT_MIN_INK_PIXELS)
+    )
+    ink_threshold = (
+        float(req.ink_threshold) if req.ink_threshold is not None else float(DEFAULT_INK_THRESHOLD)
+    )
+
+    # Parse input -> 28x28 float32 in [0,1]
+    try:
+        if req.pixels is not None:
+            x28 = _to_28x28_from_pixels(req.pixels)
+        else:
+            x28 = _to_28x28_from_b64(req.image_b64 or "")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid input image: {e}")
+
+    # Blank decision
+    blank = _is_blank(
+        x28,
+        blank_max_threshold=blank_max_threshold,
+        blank_mean_threshold=blank_mean_threshold,
+        min_ink_pixels=min_ink_pixels,
+        ink_threshold=ink_threshold,
+    )
+
+    # If blank, return early
+    if blank:
+        dbg = None
+        if return_debug:
+            dbg = {
+                "blank_metrics": _blank_metrics(x28),
+                "blank_thresholds": {
+                    "blank_max_threshold": blank_max_threshold,
+                    "blank_mean_threshold": blank_mean_threshold,
+                    "min_ink_pixels": min_ink_pixels,
+                    "ink_threshold": ink_threshold,
+                },
+            }
+        return PredictResponse(
+            model=model_path.name,
+            temperature=temperature,
+            conf_threshold=conf_threshold,
+            is_blank=True,
+            accepted=False,
+            pred_class=None,
+            confidence=None,
+            entropy=None,
+            margin=None,
+            topk=None,
+            debug=dbg,
         )
 
+    # Prepare batch (1,28,28,1)
+    x = x28[None, ..., None].astype(np.float32)
 
-# --------- Draw UI page --------------------------------------
-@app.get("/draw", response_class=HTMLResponse)
-def draw_page():
-    html = """
-    <!DOCTYPE html>
-    <html>
-    <head>
-        <title>MNIST Draw Demo</title>
-        <style>
-            body {
-                font-family: Arial, sans-serif;
-                background: #111;
-                color: #eee;
-                display: flex;
-                flex-direction: column;
-                align-items: center;
-                padding: 20px;
-            }
-            h1 {
-                margin-bottom: 5px;
-            }
-            #canvas-container {
-                margin-top: 20px;
-            }
-            canvas {
-                border: 2px solid #fff;
-                background: #000;
-                cursor: crosshair;
-            }
-            .controls {
-                margin-top: 15px;
-            }
-            button {
-                margin: 0 8px;
-                padding: 8px 16px;
-                border-radius: 4px;
-                border: none;
-                font-size: 14px;
-                cursor: pointer;
-            }
-            #predict-btn { background: #4CAF50; color: white; }
-            #clear-btn { background: #f44336; color: white; }
-            #result {
-                margin-top: 20px;
-                font-size: 20px;
-            }
-        </style>
-    </head>
-    <body>
-        <h1>MNIST Draw Demo</h1>
-        <p>Draw a digit (0–9) below, then click <strong>Predict</strong>.</p>
+    # Forward pass -> logits (1,10)
+    try:
+        logits = model(x, training=False).numpy()
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Model inference failed: {e}")
 
-        <div id="canvas-container">
-            <canvas id="canvas" width="280" height="280"></canvas>
-        </div>
+    if logits.ndim != 2 or logits.shape[1] != NUM_CLASSES:
+        raise HTTPException(status_code=500, detail=f"Unexpected logits shape: {logits.shape}")
 
-        <div class="controls">
-            <button id="clear-btn">Clear</button>
-            <button id="predict-btn">Predict</button>
-        </div>
+    probs = _logits_to_probs(logits, temperature=temperature)
+    pred = int(np.argmax(probs, axis=1)[0])
+    conf = float(np.max(probs, axis=1)[0])
 
-        <div id="result"></div>
+    # margin = top1 - top2
+    sorted_probs = np.sort(probs, axis=1)[:, ::-1]
+    margin = float(sorted_probs[0, 0] - sorted_probs[0, 1]) if sorted_probs.shape[1] >= 2 else 0.0
 
-        <script>
-            const canvas = document.getElementById('canvas');
-            const ctx = canvas.getContext('2d');
-            const clearBtn = document.getElementById('clear-btn');
-            const predictBtn = document.getElementById('predict-btn');
-            const resultDiv = document.getElementById('result');
+    ent = float(_entropy(probs)[0])
+    accepted = conf >= conf_threshold
 
-            // Canvas setup
-            ctx.fillStyle = 'black';
-            ctx.fillRect(0, 0, canvas.width, canvas.height);
-            ctx.strokeStyle = 'white';
-            ctx.lineWidth = 18;
-            ctx.lineCap = 'round';
+    topk_list = _topk(probs, k=req.topk)[0]
 
-            let drawing = false;
+    dbg = None
+    if return_debug:
+        dbg = {
+            "logits": logits[0].tolist(),
+            "probs": probs[0].tolist(),
+            "blank_metrics": _blank_metrics(x28),
+            "blank_thresholds": {
+                "blank_max_threshold": blank_max_threshold,
+                "blank_mean_threshold": blank_mean_threshold,
+                "min_ink_pixels": min_ink_pixels,
+                "ink_threshold": ink_threshold,
+            },
+        }
 
-            function getPos(e) {
-                const rect = canvas.getBoundingClientRect();
-                if (e.touches) {
-                    e = e.touches[0];
-                }
-                return {
-                    x: e.clientX - rect.left,
-                    y: e.clientY - rect.top
-                };
-            }
+    return PredictResponse(
+        model=model_path.name,
+        temperature=temperature,
+        conf_threshold=conf_threshold,
+        is_blank=False,
+        accepted=accepted,
+        pred_class=pred,
+        confidence=conf,
+        entropy=ent,
+        margin=margin,
+        topk=topk_list,
+        debug=dbg,
+    )
 
-            canvas.addEventListener('mousedown', (e) => {
-                drawing = true;
-                const pos = getPos(e);
-                ctx.beginPath();
-                ctx.moveTo(pos.x, pos.y);
-            });
 
-            canvas.addEventListener('mousemove', (e) => {
-                if (!drawing) return;
-                const pos = getPos(e);
-                ctx.lineTo(pos.x, pos.y);
-                ctx.stroke();
-            });
+# -------------------------------------------------------------------
+# Warm start (optional)
+# -------------------------------------------------------------------
 
-            canvas.addEventListener('mouseup', () => drawing = false);
-            canvas.addEventListener('mouseleave', () => drawing = false);
-
-            // Touch support
-            canvas.addEventListener('touchstart', (e) => {
-                e.preventDefault();
-                drawing = true;
-                const pos = getPos(e);
-                ctx.beginPath();
-                ctx.moveTo(pos.x, pos.y);
-            });
-
-            canvas.addEventListener('touchmove', (e) => {
-                e.preventDefault();
-                if (!drawing) return;
-                const pos = getPos(e);
-                ctx.lineTo(pos.x, pos.y);
-                ctx.stroke();
-            });
-
-            canvas.addEventListener('touchend', (e) => {
-                e.preventDefault();
-                drawing = false;
-            });
-
-            clearBtn.addEventListener('click', () => {
-                ctx.fillStyle = 'black';
-                ctx.fillRect(0, 0, canvas.width, canvas.height);
-                resultDiv.textContent = '';
-            });
-
-            predictBtn.addEventListener('click', async () => {
-                const dataURL = canvas.toDataURL('image/png');
-
-                resultDiv.textContent = 'Predicting...';
-
-                try {
-                    const response = await fetch('/predict_canvas', {
-                        method: 'POST',
-                        headers: { 'Content-Type': 'application/json' },
-                        body: JSON.stringify({ image_base64: dataURL })
-                    });
-
-                    const data = await response.json();
-
-                    if (response.ok) {
-                        const digit = data.prediction;
-                        const conf = (data.confidence * 100).toFixed(2);
-                        resultDiv.textContent = `Prediction: ${digit} (confidence: ${conf}%)`;
-                    } else {
-                        resultDiv.textContent = 'Error: ' + (data.error || 'Unknown error');
-                    }
-                } catch (err) {
-                    resultDiv.textContent = 'Request failed: ' + err;
-                }
-            });
-        </script>
-    </body>
-    </html>
-    """
-    return HTMLResponse(content=html)
+if DEFAULT_WARM_START:
+    try:
+        p = _resolve_model_path(None)
+        _ = _load_model_cached(p)
+        _ = _load_temperature_for_model(p)
+        # (optional) tiny warm inference
+        dummy = np.zeros((1, 28, 28, 1), dtype=np.float32)
+        _ = _model_cache[str(p.resolve())](dummy, training=False).numpy()
+        print(f"[warm-start] Loaded default model: {p.name}")
+    except Exception as e:
+        print(f"[warm-start] Skipped: {e}")

@@ -1,13 +1,31 @@
 # Training configuration for MNIST project
 
-run_name: "run2"       # <-- Important! Enables multiple experiment runs
-
 train:
-  epochs: 8
+  # Core
+  epochs: 15
   batch_size: 64
+  run_name: "run3"
+  seed: 42
+
+  # Optim / LR schedule
+  learning_rate: 0.001
+  schedule: "warmup_cosine"        # "warmup_cosine" | "cosine" | "none"
+  warmup_epochs: 3
+  warmup_initial_factor: 0.1       # warmup starts at 0.1 * learning_rate
+  cosine_min_factor: 0.05          # ends at 0.05 * learning_rate
+
+  # Training controls
+  early_stop_patience: 3
+  early_stop_monitor: "val_accuracy"   # OPTIONAL: "val_accuracy" | "val_loss"
+
+  # GPU / performance (3090 + WSL)
+  amp: true                        # enables mixed_float16
+  gpu_memory_growth: true          # avoids TF grabbing all VRAM
 
 paths:
   model_dir: "models"
   metrics_dir: "data/metrics"
+  reports_dir: "reports"
+  logs_dir: "logs"
   raw_dir: "data/raw"
   processed_dir: "data/processed"

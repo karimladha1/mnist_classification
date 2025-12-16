@@ -1,46 +1,88 @@
+########################################
 # Python
+########################################
 __pycache__/
-*.pyc
+*.py[cod]
 *.pyo
 *.pyd
 
+########################################
 # Virtual environments
+########################################
 .venv/
 venv/
 env/
+ENV/
 
-# Jupyter notebooks checkpoints
+########################################
+# Testing / tooling caches
+########################################
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+########################################
+# Jupyter
+########################################
 .ipynb_checkpoints/
 
-# TensorBoard logs
+########################################
+# Logs / runtime artifacts
+########################################
 logs/
+*.log
 
-# Trained models
-models/
-
-# VSCode settings
-.vscode/
-
+########################################
 # OS junk
+########################################
 .DS_Store
 Thumbs.db
-# Virtual environment
-.venv/
 
-# Python cache
-__pycache__/
-*.py[cod]
+########################################
+# Editors / IDEs
+########################################
+.vscode/
+.idea/
 
-# Jupyter notebook checkpoints
-.ipynb_checkpoints/
+########################################
+# Environment / secrets
+########################################
+.env
+.env.*
 
-# Data (keep README)
+########################################
+# ML artifacts (large binaries)
+########################################
+models/*
+!models/.gitkeep
+!models/*.temperature.json
+
+*.ckpt
+*.pt
+*.pth
+*.h5
+*.keras
+
+########################################
+# Data (keep documentation only)
+########################################
 data/raw/*
 data/processed/*
 !data/README.md
 
-# Models
-models/
+########################################
+# Experiment tracking
+########################################
+wandb/
+mlruns/
 
-# VS Code settings
-.vscode/
+########################################
+# Docker
+########################################
+__docker__/tmp/
+
+
+########################################
+# data/metrics/

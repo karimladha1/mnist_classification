@@ -1,0 +1,32 @@
+[project]
+name = "my-ml-project"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy",
+  "pandas",
+  "tqdm",
+  "pyyaml",
+  "matplotlib",
+  "scikit-learn",
+  "pytest"
+]
+
+# Install PyTorch separately if you want a specific CUDA build,
+# OR add it here if you're standardizing on one environment.
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = ["E501"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
